@@ -1,0 +1,476 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<html>
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=utf-8"/>
+	<title></title>
+	<meta name="generator" content="LibreOffice 5.1.1.3 (Linux)"/>
+	<meta name="created" content="00:00:00"/>
+	<meta name="changed" content="00:00:00"/>
+	<style type="text/css">
+		@page { margin: 2cm }
+		p { margin-bottom: 0.25cm; line-height: 120% }
+	</style>
+</head>
+<body lang="zh-CN" dir="ltr">
+<pre><span lang="en-US">QueueNode:</span>
+  <span lang="en-US">type = Reader/Writer</span>
+  <span lang="en-US">granted = False</span>
+  <span lang="en-US">prev = NULL</span>
+  <span lang="en-US">next = NULL</span>
+  <span lang="en-US">flags = {stype = None, busy = False, status = Waiting} }</span>
+
+<span lang="en-US">Lock:</span>
+  <span lang="en-US">next_writer = NULL</span>
+  <span lang="en-US">readers = 0</span>
+  <span lang="en-US">tail = NULL</span>
+
+<span lang="en-US">def acquire_reader_lock(lock, me, timeout) {</span>
+  <span lang="en-US">pred = XCHG(lock.tail, me)</span>
+  <span lang="en-US">if pred is NULL:</span>
+    <span lang="en-US">lock.readers++</span>
+    <span lang="en-US">me.granted = True</span>
+    <span lang="en-US">return finish_acquire_reader_lock(lock.tail, me)</span>
+
+  <span lang="en-US"># haven't set pred.next.id yet, safe to dereference pred</span>
+  <span lang="en-US">if pred.type is Reader:</span>
+    <span lang="en-US">return acquire_reader_lock_check_reader_pred(lock.tail, me, pred, timeout)</span>
+  <span lang="en-US">return acquire_reader_lock_check_writer_pred(lock.tail, me, pred, timeout)</span>
+
+<span lang="en-US">def finish_acquire_reader_lock(lock, me) {</span>
+  <span lang="en-US">me.next.busy = True</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+
+  <span lang="en-US"># if the lock tail now still points to me, truly no one is there, we're done</span>
+  <span lang="en-US">if lock.tail == me:</span>
+    <span lang="en-US">me.busy = False</span>
+    <span lang="en-US">return Acquired</span>
+  
+  <span lang="en-US"># note that the successor can't cancel now, ie me.next pointer is stable</span>
+  <span lang="en-US">spin until me.next is not NULL</span>
+  <span lang="en-US">successor = me.next</span>
+  <span lang="en-US">if successor is NoSuccessor or successor.type is Writer:</span>
+    <span lang="en-US">me.busy = False</span>
+  <span lang="en-US">return Acquired</span>
+
+  <span lang="en-US"># successor might be cancelling, in which case it'd xchg me.next.id to NoSuccessor;</span>
+  <span lang="en-US"># it's also possible that my cancelling writer successor is about to give me a new</span>
+  <span lang="en-US"># reader successor, in this case my cancelling successor will realize that I already</span>
+  <span lang="en-US"># have the lock and try to wake up the new successor directly also by trying to change</span>
+  <span lang="en-US"># me.next.id to NoSuccessor (the new successor might spin forever if its timeout is</span>
+  <span lang="en-US"># Never and the cancelling successor didn't wake it up).</span>
+  <span lang="en-US">if not CAS(me.next, successor, NoSuccessor):</span>
+    <span lang="en-US">me.busy = False</span>
+    <span lang="en-US">return Acquired</span>
+
+  <span lang="en-US">if me.status is Granted and me.stype is None:</span>
+    <span lang="en-US"># successor might have seen me in leaving state, it'll wait for me in that case</span>
+    <span lang="en-US"># in this case, the successor saw me in leaving state and didnt register as a reader</span>
+    <span lang="en-US"># ie successor was acquiring</span>
+    <span lang="en-US">spin until successor.prev is me</span>
+    <span lang="en-US">if CAS(successor.prev, me, Acquired):</span>
+      <span lang="en-US">lock.readers++</span>
+      <span lang="en-US">successor.granted = True</span>
+      <span lang="en-US"># make sure I know when releasing no need to wait</span>
+      <span lang="en-US">me.next = NoSuccessor</span>
+  <span lang="en-US">elif me.stype is Reader:</span>
+    <span lang="en-US">while True:</span>
+      <span lang="en-US">spin until successor.prev is me</span>
+      <span lang="en-US">if CAS(successor.prev, me, Acquired):</span>
+        <span lang="en-US">++lock.readers</span>
+        <span lang="en-US">successor.granted = True</span>
+        <span lang="en-US">me.next = NoSuccessor</span>
+        <span lang="en-US">break</span>
+
+  <span lang="en-US">me.busy = False</span>
+  <span lang="en-US">return Acquired</span>
+
+<span lang="en-US">def acquire_reader_lock_check_reader_pred(lock, me, pred, timeout):</span>
+<span lang="en-US">check_pred:</span>
+  <span lang="en-US"># wait for the previous canceling dude to leave</span>
+  <span lang="en-US">spin until pred.next is NULL and pred.stype is None</span>
+  
+  <span lang="en-US">flags = CAS(pred.flags, None | False | Waiting, Reader | False | Waiting)</span>
+  <span lang="en-US">if flags is None | False | Waiting:  # succeeded</span>
+    <span lang="en-US">link_pred(pred, me)</span>
+    <span lang="en-US">if me.granted_within(timeout):</span>
+      <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+    <span lang="en-US">if timeout is 0:</span>
+      <span lang="en-US">return Requested</span>
+    <span lang="en-US">return cancel_reader_lock(lock, me)</span>
+
+  <span lang="en-US"># Failed cases</span>
+  <span lang="en-US">if flags.status is Leaving:</span>
+    <span lang="en-US"># don't set pred.next.successor_class here</span>
+    <span lang="en-US">link_pred(pred, me)</span>
+    <span lang="en-US"># if pred did cancel, it will give me a new pred; if it got the lock it will wake me up</span>
+    <span lang="en-US">spin until me.prev is not pred</span>
+    <span lang="en-US"># consume it and retry</span>
+    <span lang="en-US">pred = XCHG(me.prev, NULL)</span>
+    <span lang="en-US">if pred is Acquired:</span>
+      <span lang="en-US">spin until me.granted is True</span>
+      <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+
+    <span lang="en-US">if pred.type is Writer:</span>
+      <span lang="en-US">return acquire_reader_lock_check_writer_pred(lock, me, pred, timeout)</span>
+    <span lang="en-US">goto check_pred</span>
+  <span lang="en-US">else</span>
+    <span lang="en-US"># pred is granted - might be a direct grant or grant in the leaving process</span>
+    <span lang="en-US"># I didn't register, pred won't wake me up, but if pred is leaving_granted,</span>
+    <span lang="en-US"># we need to tell it not to poke me in its finish-acquire call. For direct_granted,</span>
+    <span lang="en-US"># also set its next.id to NoSuccessor so it knows that there's no need to wait and</span>
+    <span lang="en-US"># examine successor upon release. This also covers the case when pred.next.flags</span>
+    <span lang="en-US"># has Busy set.</span>
+    <span lang="en-US">prev.next = NoSuccessor</span>
+    <span lang="en-US">++lock.readers</span>
+    <span lang="en-US">me.granted = True</span>
+    <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+
+<span lang="en-US">def cancel_reader_lock(lock, me):</span>
+  <span lang="en-US">pred = XCHG(me.prev, NULL)  # prevent pred from cancelling</span>
+  <span lang="en-US">if pred is Acquired:</span>
+    <span lang="en-US">spin until me.granted is True</span>
+    <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+
+  <span lang="en-US"># make sure successor can't leave, unless it tried to leave first</span>
+  <span lang="en-US">me.status = Leaving</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+
+  <span lang="en-US">if pred.type is Reader:</span>
+    <span lang="en-US">return cancel_reader_lock_with_reader_pred(lock, me, pred)</span>
+  <span lang="en-US">return cancel_reader_lock_with_writer_pred(lock, me, pred)</span>
+
+<span lang="en-US">def cancel_reader_lock_with_writer_pred(lock, me, pred):</span>
+<span lang="en-US">retry:</span>
+  <span lang="en-US"># wait for the cancelling pred to finish relink</span>
+  <span lang="en-US">spin until pred.next is me and pred.stype is Reader</span>
+  <span lang="en-US"># pred is a writer, so I can go as long as it's not also leaving (cancelling or releasing)</span>
+  <span lang="en-US">while True:</span>
+    <span lang="en-US"># Must take a copy first</span>
+    <span lang="en-US">eflags = pred.flags</span>
+    <span lang="en-US">if eflags.status is Leaving:</span>
+      <span lang="en-US"># must wait for pred to give me a new pred (or wait to be waken up?)</span>
+      <span lang="en-US"># pred should give me a new pred, after its CAS trying to pass me the lock failed</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">pred = XCHG(me.prev, NULL)</span>
+      <span lang="en-US">if pred is NULL or pred is Acquired:</span>
+        <span lang="en-US">spin until me.granted is True</span>
+        <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+      <span lang="en-US">else</span>
+        <span lang="en-US"># make sure successor can't leave, unless it tried to leave first</span>
+        <span lang="en-US">me.status = Leaving</span>
+        <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+        <span lang="en-US">if pred.type is Reader:</span>
+          <span lang="en-US">return cancel_reader_lock_with_reader_pred(lock, me, pred)</span>
+        <span lang="en-US">goto retry</span>
+    <span lang="en-US">elif eflags.busy is True:</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">spin until me.granted is True</span>
+      <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+    <span lang="en-US"># try to tell pred I'm leaving</span>
+    <span lang="en-US">if CAS(pred.(next | flags), eflags | me , eflags | SuccessorLeaving):</span>
+      <span lang="en-US">break</span>
+
+  <span lang="en-US"># pred now has SuccessorLeaving on its next.id, it won't try to wake me up during release</span>
+  <span lang="en-US"># now link the new successor and pred</span>
+  <span lang="en-US">if me.next is NULL and CAS(lock.tail, me, pred):</span>
+    <span lang="en-US">pred.stype = None</span>
+    <span lang="en-US">pred.next = NULL</span>
+    <span lang="en-US">return Cancelled</span>
+
+  <span lang="en-US">cancel_reader_lock_relink(pred, me, pred)</span>
+  <span lang="en-US">return Cancelled</span>
+
+<span lang="en-US">def cancel_reader_lock_with_reader_pred(lock, me, pred):</span>
+<span lang="en-US">retry:</span>
+  <span lang="en-US"># now successor can't attach to me assuming I'm waiting or has already done so.</span>
+  <span lang="en-US"># CAS out of pred.next (including id and flags)</span>
+  <span lang="en-US"># wait for the canceling pred to finish the relink</span>
+  <span lang="en-US">spin until pred.stype is Reader and (pred.next is me or pred.next is NoSuccessor)</span>
+
+  <span lang="en-US"># only want to put SuccessorLeaving in the id field</span>
+  <span lang="en-US">expected = me | { Reader, False, Waiting }</span>
+  <span lang="en-US">desired = SuccessorLeaving | {Reader, False, Waiting }</span>
+  <span lang="en-US">value = CAS(pred.(next | flags), expected, desired)</span>
+  <span lang="en-US">if value is not expected:</span>
+    <span lang="en-US"># Note: we once registered after pred as a reader successor (still are), so if</span>
+    <span lang="en-US"># pred happens to get the lock, it will wake me up seeing its reader_successor set</span>
+    <span lang="en-US">if value.flags.status is Granted:</span>
+      <span lang="en-US"># pred will in its finish-acquire-reader() wake me up.</span>
+      <span lang="en-US"># pred already should alredy have me on its next.id and has reader successor class,</span>
+      <span lang="en-US"># now me.pred.id is 0, blocking pred from waking me up, so just set me.pred.id</span>
+      <span lang="en-US"># (the CAS loop in the &quot;acquired&quot; block).</span>
+      <span lang="en-US"># this also covers the case when pred.next.flags has busy set.</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">spin until me.granted is True</span>
+      <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+    <span lang="en-US">else</span>
+      <span lang="en-US"># pred is trying to leave, wait for a new pred or being waken up</span>
+      <span lang="en-US"># pred has higher priority to leave, and it should already have me on its next.id</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">spin until me.prev is not pred</span>
+      <span lang="en-US"># consume it and retry</span>
+      <span lang="en-US">pred = XCHG(me.prev, NULL)</span>
+      <span lang="en-US">if pred is Acquired):</span>
+        <span lang="en-US">spin until me.granted is True</span>
+        <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+      <span lang="en-US">if pred.type is Writer:</span>
+        <span lang="en-US">return cancel_reader_lock_with_writer_pred(lock, me, pred)</span>
+      <span lang="en-US">goto retry</span>
+  <span lang="en-US">else</span>
+    <span lang="en-US"># at this point pred will be waiting for a new successor if it decides</span>
+    <span lang="en-US"># to move and successor will be waiting for a new pred</span>
+    <span lang="en-US">if me.flags.stype is None and CAS(lock.tail, me, pred):</span>
+      <span lang="en-US"># newly arriving successor for this pred will wait</span>
+      <span lang="en-US"># for the SuccessorLeaving mark to go away before trying the CAS</span>
+      <span lang="en-US">pred.flags.stype = None</span>
+      <span lang="en-US">pred.next = NULL</span>
+      <span lang="en-US">return Cancelled</span>
+    <span lang="en-US">cancel_reader_lock_relink(pred, me)</span>
+  <span lang="en-US">return Cancelled</span>
+
+<span lang="en-US">def cancel_reader_lock_relink(pred, me):</span>
+  <span lang="en-US">spin until me.next is not NULL</span>
+
+  <span lang="en-US">while True:  #preserve pred.flags</span>
+    <span lang="en-US">expected = pred.{ next | flags }</span>
+    <span lang="en-US">new_next = expected</span>
+    <span lang="en-US">new_next.next = me.next</span>
+    <span lang="en-US">new_next.stype = expected.stype</span>
+    <span lang="en-US">new_next.busy = expected.busy</span>
+    <span lang="en-US">if CAS(pred.{ next | flags }, expected, new_next):</span>
+      <span lang="en-US">break</span>
+
+  <span lang="en-US"># I believe we should do this after setting pred.id, see the comment in cancel_writer_lock.</span>
+  <span lang="en-US">retry until CAS(me.next.prev, me, pred) is True</span>
+
+<span lang="en-US">def acquire_reader_lock_check_writer_pred(lock, me, pred, timeout):</span>
+  <span lang="en-US"># wait for the previous canceling dude to leave</span>
+  <span lang="en-US">spin until pred.next is NULL and pred.stype is None</span>
+  <span lang="en-US"># pred is a writer, we have to wait anyway, so register and wait with timeout</span>
+  <span lang="en-US">pred.stype = Reader</span>
+  <span lang="en-US">pred.next = me</span>
+  <span lang="en-US">if XCHG(me.prev, pred) is Acquired:</span>
+    <span lang="en-US">timeout = Never</span>
+
+  <span lang="en-US">if granted_within(timeout):</span>
+    <span lang="en-US">return finish_acquire_reader_lock(lock, me)</span>
+  <span lang="en-US">if timeout is 0:</span>
+    <span lang="en-US">return Requested</span>
+  <span lang="en-US">return cancel_reader_lock(lock, me)</span>
+
+<span lang="en-US">def release_reader_lock(lock, me):</span>
+  <span lang="en-US"># make sure successor can't leave; readers, however, can still get the lock as usual</span>
+  <span lang="en-US"># by seeing me.next.flags.granted set</span>
+  <span lang="en-US">me.busy = True</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+
+  <span lang="en-US">while me.next is NULL:</span>
+    <span lang="en-US">if CAS(lock.tail, me, NULL):</span>
+      <span lang="en-US">finish_release_reader_lock(lock)</span>
+      <span lang="en-US">return</span>
+
+  <span lang="en-US">if me.next is not NoSuccessor and me.stype is Writer:</span>
+    <span lang="en-US"># put it in next_writer</span>
+    <span lang="en-US">lock.next_writer = me.next</span>
+    <span lang="en-US"># also tell successor it doesn't have pred any more</span>
+    <span lang="en-US">retry until CAS(me.next.prev, me, NULL) is True</span>
+  <span lang="en-US">finish_release_reader_lock(lock)</span>
+
+<span lang="en-US">def finish_release_reader_lock(lock):</span>
+  <span lang="en-US">if FAA(lock.readers, -1) == 1:  # I'm the last reader, must handle the next writer</span>
+    <span lang="en-US">nw = lock.next_writer</span>
+    <span lang="en-US">if nw is not NULL and lock.readers is 0 and CAS(lock.next_writer, nw, NULL):</span>
+      <span lang="en-US">retry until CAS(nw.prev, NULL, Acquired) is True</span>
+      <span lang="en-US">nw.granted = True</span>
+
+<span lang="en-US">def acquire_writer_lock(lock, me, timeout):</span>
+  <span lang="en-US">pred = XCHG(lock.tail, me)</span>
+  <span lang="en-US">if pred is 0:</span>
+    <span lang="en-US">lock.next_writer = me</span>
+    <span lang="en-US">if lock.readers is 0 and XCHG(lock.next_writer, NULL) is me:</span>
+      <span lang="en-US">me.granted = True</span>
+      <span lang="en-US">return Acquired</span>
+  <span lang="en-US">else</span>
+    <span lang="en-US">spin until pred.stype is None and pred.next is NULL</span>
+    <span lang="en-US"># register on pred.flags as a writer successor, then fill in pred.next.id and wait</span>
+    <span lang="en-US"># must register on pred.flags first</span>
+    <span lang="en-US">pred.stype = Writer</span>
+    <span lang="en-US">pred.next = me</span>
+
+  <span lang="en-US">if XCHG(me.pred, pred) is Acquired:</span>
+    <span lang="en-US">timeout = Never</span>
+
+  <span lang="en-US">if me.granted_within(timeout):</span>
+    <span lang="en-US">me.status = Granted</span>
+    <span lang="en-US">return Acquired</span>
+
+  <span lang="en-US">if timeout is 0:</span>
+    <span lang="en-US">return Requested</span>
+  <span lang="en-US">return cancel_writer_lock(lock, me)</span>
+
+<span lang="en-US">def release_writer_lock(lock, me):</span>
+  <span lang="en-US">me.busy = True  # make sure succesor can't leave</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+
+  <span lang="en-US">while me.next is NULL:</span>
+    <span lang="en-US">if CAS(lock.tail, me, NULL) is True:</span>
+      <span lang="en-US">return</span>
+
+  <span lang="en-US">retry until CAS(me.next.prev, me, Acquired) is True</span>
+  <span lang="en-US">if me.next.type is Reader:</span>
+    <span lang="en-US">++lock.readers</span>
+  <span lang="en-US">me.next.granted = True</span>
+
+<span lang="en-US">def cancel_writer_lock(lock, me):</span>
+<span lang="en-US">start_cancel:</span>
+  <span lang="en-US">pred = XCHG(me.prev, NULL)</span>
+  <span lang="en-US"># if pred is a releasing writer and already dereference my id, it will CAS me.pred.id</span>
+  <span lang="en-US"># to Acquired, so we do a final check here; there's no way back after this point</span>
+  <span lang="en-US"># (unless pred is a reader and it's already gone).</span>
+  <span lang="en-US"># After my xchg, pred will be waiting for me to give it a new successor.</span>
+  <span lang="en-US">if pred is Acquired:</span>
+    <span lang="en-US">spin until me.granted is True</span>
+    <span lang="en-US">me.status = Granted</span>
+    <span lang="en-US">return Acquired</span>
+
+  <span lang="en-US"># &quot;freeze&quot; the successor</span>
+  <span lang="en-US">me.status = Leaving</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+
+  <span lang="en-US"># if I still have a pred, then deregister from it; if I don't have a pred,</span>
+  <span lang="en-US"># that means my pred has put me on next_writer, deregister from there and go</span>
+  <span lang="en-US"># Note that the reader should first reset me.pred.id, then put me on lock.nw</span>
+  <span lang="en-US">if pred is NULL:</span>
+    <span lang="en-US">return cancel_writer_lock_no_pred(lock, me)</span>
+
+  <span lang="en-US">while True:</span>
+    <span lang="en-US"># wait for cancelling pred to finish relink, note pred_block is updated</span>
+    <span lang="en-US"># later in the if block as well</span>
+    <span lang="en-US">spin until pred.next is me and pred.stype is Writer</span>
+    <span lang="en-US"># whatever flags value it might have, just not Leaving</span>
+    <span lang="en-US">eflags = pred.flags</span>
+    <span lang="en-US">if eflags.status is Leaving:</span>
+      <span lang="en-US"># pred might be cancelling, we won't know if it'll eventually</span>
+      <span lang="en-US"># get the lock or really cancel. In the former case it won't update my pred;</span>
+      <span lang="en-US"># in the latter case it will. So just recover me.pred.id and retry (can't reset</span>
+      <span lang="en-US"># next.flags to Waiting - that will confuse our successor).</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">goto start_cancel</span>
+    <span lang="en-US">elif eflags.busy is True:</span>
+      <span lang="en-US"># pred is perhaps releasing (writer)? me.pred.id is 0, pred can do nothing about me,</span>
+      <span lang="en-US"># so it's safe to dereference</span>
+      <span lang="en-US">if pred.type is Writer:</span>
+        <span lang="en-US">me.prev = pred</span>
+        <span lang="en-US">spin until me.granted is True</span>
+        <span lang="en-US">me.status = Granted</span>
+        <span lang="en-US">return Acquired</span>
+      <span lang="en-US">me.prev = pred</span>
+      <span lang="en-US">pred = XCHG(me.prev, NULL)</span>
+      <span lang="en-US">if pred is 0:</span>
+        <span lang="en-US">return cancel_writer_lock_no_pred(lock, me)</span>
+      <span lang="en-US">elif pred is Acquired:</span>
+        <span lang="en-US">spin until me.granted is True</span>
+        <span lang="en-US">me.status = Granted</span>
+        <span lang="en-US">return Acquired</span>
+      <span lang="en-US">continue  # retry if it's a reader</span>
+
+    <span lang="en-US">desired = eflags | SuccessorLeaving</span>
+    <span lang="en-US">expected = eflags | me</span>
+    <span lang="en-US">if CAS(pred.{ next | flags }, expected, desired) is True:</span>
+      <span lang="en-US">break</span>
+
+  <span lang="en-US">if me.next is NULL and CAS(lock.tail, me, pred) is True:</span>
+    <span lang="en-US">pred.stype = None</span>
+    <span lang="en-US">pred.next = NULL</span>
+    <span lang="en-US">return Cancelled</span>
+  <span lang="en-US">spin until me.next is not NULL</span>
+  <span lang="en-US">successor = { me.next | me.stype, False, Waiting }</span>
+
+<span lang="en-US">retry:</span>
+  <span lang="en-US"># preserve pred.flags</span>
+  <span lang="en-US">expected = pred.{ next | flags }</span>
+  <span lang="en-US">wakeup = False</span>
+
+  <span lang="en-US">if pred.type is Reader and me.next.type is Reader and pred.status == Granted:</span>
+    <span lang="en-US"># There is a time window which starts after the pred finishedits &quot;acquired&quot; block</span>
+    <span lang="en-US"># and ends before it releases. During this period my relink is essentially invisible</span>
+    <span lang="en-US"># to pred. So we try to wake up the successor if this is the case.</span>
+    <span lang="en-US">successor.next = NoSuccessor</span>
+    <span lang="en-US">wakeup = True</span>
+
+  <span lang="en-US">if pred.busy is True:</span>
+    <span lang="en-US">successor.busy = True</span>
+  <span lang="en-US">if not CAS(pred.{ next | flags }, expected, successor):</span>
+    <span lang="en-US">goto retry</span>
+
+  <span lang="en-US"># Now we need to wake up the successor if needed and set succ.pred.id - must set succ.pred.id</span>
+  <span lang="en-US"># after setting pred.next.id: if we need to wake up successor, we need to also set pred.next.id</span>
+  <span lang="en-US"># to NoSuccessor, which makes it not safe for succ to spin on pred.next.id to wait for me</span>
+  <span lang="en-US"># finishing this relink (pred might disappear any time because its next.id is NoSuccessor).</span>
+  <span lang="en-US">if (wakeup) {</span>
+    <span lang="en-US">++lock.readers</span>
+    <span lang="en-US">me.next.granted = True</span>
+    <span lang="en-US">retry until CAS(me.next.pred, me, Acquired) is True</span>
+  <span lang="en-US">else</span>
+    <span lang="en-US">retry until CAS(me.next, me, pred) is True</span>
+  <span lang="en-US">return Cancelled</span>
+
+<span lang="en-US">def cancel_writer_lock_no_pred(lock, me):</span>
+  <span lang="en-US">spin until lock.next_writer is not NULL or me.granted is True</span>
+  <span lang="en-US">if me.granted is True or not CAS(lock.next_writer, me, NULL):</span>
+    <span lang="en-US"># reader picked me up...</span>
+    <span lang="en-US">spin until me.granted is True</span>
+    <span lang="en-US">me.status = Granted</span>
+    <span lang="en-US">return Acquired</span>
+
+  <span lang="en-US"># so lock.next_writer is null now, try to fix the lock tail</span>
+  <span lang="en-US">if me.next is NULL and CAS(lock.tail, me, NULL):</span>
+    <span lang="en-US">return Cancelled</span>
+
+  <span lang="en-US">spin until me.next is not NULL</span>
+  <span lang="en-US">next = me.next  # must copy first</span>
+
+  <span lang="en-US"># because I don't have a pred, if next_id is a writer, I should put it in lock.nw</span>
+  <span lang="en-US">if next.type is Writer:</span>
+    <span lang="en-US"># remaining readers will use CAS on lock.nw, so we blind write</span>
+    <span lang="en-US">lock.next_writer = next</span>
+    <span lang="en-US">retry until CAS(next.prev, me, NULL) is True</span>
+    <span lang="en-US">if lock.readers is 0 and CAS(lock.next_writer, next, NULL):</span>
+      <span lang="en-US"># ok, I'm so nice, cancelled myself and woke up a successor</span>
+      <span lang="en-US">retry until CAS(next.prev, NULL, Acquired) is True</span>
+      <span lang="en-US">next.granted = True</span>
+  <span lang="en-US">else</span>
+    <span lang="en-US"># successor is a reader, lucky for it...</span>
+    <span lang="en-US">retry until CAS(next.prev, me, Acquired) is True</span>
+    <span lang="en-US">++lock.readers</span>
+    <span lang="en-US">next.granted = True</span>
+  <span lang="en-US">return Cancelled</span>
+  
+<span lang="en-US">def release_reader_lock(lock, me):</span>
+  <span lang="en-US">me.busy = True</span>
+  <span lang="en-US">spin until me.next is not SuccessorLeaving</span>
+  
+  <span lang="en-US"># see if no one is behind me by trying to fix lock.tail</span>
+  <span lang="en-US">while me.next is 0:</span>
+    <span lang="en-US">if CAS(lock.tail, me, NULL):</span>
+      <span lang="en-US">goto finish</span>
+      
+  <span lang="en-US"># so I do have some successor, prepare it for getting the lock later if it's a writer</span>
+  <span lang="en-US">successor = me.next</span>
+  <span lang="en-US">if successor is not NoSuccessor and me.stype == Writer:</span>
+    <span lang="en-US"># put the successor in next_writer</span>
+    <span lang="en-US">lock.next_writer = successor</span>
+    <span lang="en-US">retry until CAS(successor.prev, me, NULL) succeeds</span>
+  <span lang="en-US"># otherwise we already handled this successor (e.g., during finish_reader_acquire)</span>
+  
+<span lang="en-US">finish:</span>
+  <span lang="en-US">if lock.nreaders-- == 1:</span>
+    <span lang="en-US">next_writer = lock.next_writer</span>
+    <span lang="en-US">if next_writer is not NULL and</span>
+       <span lang="en-US">lock.nreaders == 0 and</span>
+       <span lang="en-US">CAS(lock.next_writer, next_writer, NULL) == True:</span>
+      <span lang="en-US">retry until CAS(next_writer.prev, NULL, Acquired) succeeds</span>
+      <span lang="en-US">next_writer.granted = True</span>
+</pre>
+</body>
+</html>
